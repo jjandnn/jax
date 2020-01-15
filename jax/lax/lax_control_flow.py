@@ -42,7 +42,7 @@ from jax.lib import xla_client
 from jax.util import (partial, unzip2, safe_map, safe_zip, split_list,
                       split_dict, cache, extend_name_stack)
 from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
-                           treedef_children, treedef_tuple)
+                           treedef_children, treedef_tuple, tree_leaves)
 from jax import ad_util
 
 _map = safe_map

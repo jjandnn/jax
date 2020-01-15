@@ -27,6 +27,7 @@ arrays.
 import collections
 import functools
 import itertools as it
+import inspect
 import operator as op
 import os
 import threading
@@ -1439,534 +1440,6 @@ def _valid_jaxtype(arg):
     return True
 
 
-class CustomTransformsFunction(object):
-  def __init__(self, fun, prim):
-    self.fun = fun
-    self.prim = prim
-    wraps(fun)(self)
-
-  def __repr__(self):
-    return '<jax.custom_transforms function {fun}>'.format(fun=self.__name__)
-
-  def __call__(self, *args):
-    # TODO(mattjj): instead of tracing to a jaxpr, use process_call
-    args_flat, in_tree = tree_flatten(args)
-    flat_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(self.fun), in_tree)
-    in_pvals = [pe.PartialVal((raise_to_shaped(core.get_aval(x)), core.unit))
-                for x in args_flat]
-    jaxpr, _, consts = pe.trace_to_jaxpr(flat_fun, in_pvals, instantiate=True)
-    outs = self.prim.bind(*it.chain(consts, args_flat), jaxpr=jaxpr,
-                          in_tree=in_tree, out_tree=out_tree(),
-                          num_consts=len(consts))
-    return tree_unflatten(out_tree(), outs)
-
-def custom_transforms(fun):
-  """Wraps a function so that its transformation behavior can be controlled.
-
-  A primary use case of ``custom_transforms`` is defining custom VJP rules (aka
-  custom gradients) for a Python function, while still supporting other
-  transformations like ``jax.jit`` and ``jax.vmap``. Custom differentiation
-  rules can be supplied using the ``jax.defjvp`` and ``jax.defvjp`` functions.
-
-  The ``custom_transforms`` decorator wraps ``fun`` so that its transformation
-  behavior can be overridden, but not all transformation rules need to be
-  specified manually. The default behavior is retained for any non-overridden
-  rules.
-
-  The function ``fun`` must satisfy the same constraints required for jit
-  compilation. In particular the shapes of arrays in the computation of ``fun``
-  may depend on the shapes of ``fun``'s arguments, but not their values.
-  Value dependent Python control flow is also not yet supported.
-
-  Args:
-    fun: a Python callable. Must be functionally pure. Its arguments and return
-      value should be arrays, scalars, or (nested) standard Python containers
-      (tuple/list/dict) thereof.
-
-  Returns:
-    A Python callable with the same input/output and transformation behavior as
-    ``fun``, but for which custom transformation rules can be supplied, e.g.
-    using ``jax.defvjp``.
-
-  For example:
-
-  >>> @jax.custom_transforms
-  ... def f(x):
-  ...   return np.sin(x ** 2)
-  ...
-  >>> print(f(3.))
-  0.4121185
-  >>> print(jax.grad(f)(3.))
-  -5.4667816
-  >>> jax.defvjp(f, lambda g, x: g * x)
-  >>> print(jax.grad(f)(3.))
-  3.0
-  """
-  name = getattr(fun, '__name__', '<unnamed custom_transforms primitive>')
-  fun_p = core.Primitive(name)
-  fun_p.multiple_results = True
-
-  def fun_impl(*args, **params):
-    consts, args = split_list(args, [params['num_consts']])
-    return core.eval_jaxpr(params['jaxpr'], consts, *args)
-  fun_p.def_impl(fun_impl)
-
-  def fun_jvp(primals, tangents, **params):
-    return ad.jvp(lu.wrap_init(fun_impl, params)).call_wrapped(primals, tangents)
-  ad.primitive_jvps[fun_p] = fun_jvp
-
-  def fun_batch(args, dims, **params):
-    return batching.batch_fun(lu.wrap_init(fun_impl, params), args, dims)
-  batching.primitive_batchers[fun_p] = fun_batch
-
-  def fun_abstract_eval(*avals, **params):
-    return pe.abstract_eval_fun(fun_impl, *avals, **params)
-  fun_p.def_abstract_eval(fun_abstract_eval)
-
-  def fun_translation(c, *xla_args, **params):
-    return xla.lower_fun(fun_impl, True)(c, *xla_args, **params)
-  xla.translations[fun_p] = fun_translation
-
-  return CustomTransformsFunction(fun, fun_p)
-
-def _check_custom_transforms_type(name, fun):
-  if type(fun) is not CustomTransformsFunction:
-    msg = ("{} requires a custom_transforms function as its first argument, "
-          "but got type {}.")
-    raise TypeError(msg.format(name, type(fun)))
-
-def defjvp_all(fun, custom_jvp):
-  """Define a custom JVP rule for a ``custom_transforms`` function.
-
-  If ``fun`` represents a function with signature ``a -> b``, then
-  ``custom_jvp`` represents a function with signature ``(a, T a) -> (b, T b)``,
-  where we use ``T x`` to represent a tangent type for the type ``x``.
-
-  In more detail, ``custom_jvp`` must take two arguments, both tuples of length
-  equal to the number of positional arguments to ``fun``. The first argument to
-  ``custom_jvp`` represents the input primal values, and the second represents
-  the input tangent values. ``custom_jvp`` must return a pair where the first
-  element represents the output primal value and the second element represents
-  the output tangent value.
-
-  Defining a custom JVP rule also affects the default VJP rule, which is derived
-  from the JVP rule automatically via transposition.
-
-  Args:
-    fun: a custom_transforms function.
-    custom_jvp: a Python callable specifying the JVP rule, taking two tuples as
-      arguments specifying the input primal values and tangent values,
-      respectively. The tuple elements can be arrays, scalars, or (nested)
-      standard Python containers (tuple/list/dict) thereof. The output must be a
-      pair representing the primal output and tangent output, which  can be
-      arrays, scalars, or (nested) standard Python containers. Must be
-      functionally pure.
-
-  Returns:
-    None. A side-effect is that ``fun`` is associated with the JVP rule
-    specified by ``custom_jvp``.
-
-  For example:
-
-  >>> @jax.custom_transforms
-  ... def f(x):
-  ...   return np.sin(x ** 2)
-  ...
-  >>> print(f(3.))
-  0.4121185
-  >>> out_primal, out_tangent = jax.jvp(f, (3.,), (2.,))
-  >>> print(out_primal)
-  0.4121185
-  >>> print(out_tangent)
-  -10.933563
-  >>> jax.defjvp_all(f, lambda ps, ts: (np.sin(ps[0] ** 2), 8. * ts[0]))
-  >>> out_primal, out_tangent = jax.jvp(f, (3.,), (2.,))
-  >>> print(out_primal)
-  0.4121185
-  >>> print(out_tangent)
-  16.0
-  """
-  _check_custom_transforms_type("defjvp_all", fun)
-  def custom_transforms_jvp(primals, tangents, **params):
-    num_consts, in_tree = params['num_consts'], params['in_tree']
-    _, args_flat = split_list(primals, [num_consts])
-    consts_dot, args_dot_flat = split_list(tangents, [num_consts])
-    if not all(t is ad_util.zero for t in consts_dot):
-      msg = ("Detected differentiation with respect to closed-over values with "
-             "custom JVP rule, which isn't supported.")
-      raise ValueError(msg)
-    args = tree_unflatten(in_tree, args_flat)
-    args_dot = tree_unflatten(in_tree, args_dot_flat)
-    out, out_dot = custom_jvp(args, args_dot)
-    out_flat, out_tree = tree_flatten(out)
-    out_dot_flat, out_tree2 = tree_flatten(out_dot)
-    if out_tree != out_tree2:
-      msg = ("Custom JVP rule returned different tree structures for primals "
-             "and tangents, but they must be equal: {} and {}.")
-      raise TypeError(msg.format(out_tree, out_tree2))
-    return out_flat, out_dot_flat
-  ad.primitive_jvps[fun.prim] = custom_transforms_jvp
-
-def defjvp(fun, *jvprules):
-  """Definine JVP rules for each argument separately.
-
-  This function is a convenience wrapper around ``jax.defjvp_all`` for
-  separately defining JVP rules for each of the function's arguments. This
-  convenience wrapper does not provide a mechanism for depending on anything
-  other than the function arguments and its primal output value, though
-  depending on intermediate results is possible using ``jax.defjvp_all``.
-
-  The signature of each component JVP rule is ``lambda g, ans, *primals: ...``
-  where ``g`` represents the tangent of the corresponding positional argument,
-  ``ans`` represents the output primal, and ``*primals`` represents all the
-  primal positional arguments.
-
-  Defining a custom JVP rule also affects the default VJP rule, which is derived
-  from the JVP rule automatically via transposition.
-
-  Args:
-    fun: a custom_transforms function.
-    *jvprules: a sequence of functions or Nones specifying the JVP rule for each
-      corresponding positional argument. When an element is None, it indicates
-      that the Jacobian from the corresponding input to the output is zero.
-
-  Returns:
-    None. A side-effect is that ``fun`` is associated with the JVP rule
-    specified by ``*jvprules``.
-
-  For example:
-
-  >>> @jax.custom_transforms
-  ... def f(x):
-  ...   return np.sin(x ** 2)
-  ...
-  >>> print(f(3.))
-  0.4121185
-  >>> out_primal, out_tangent = jax.jvp(f, (3.,), (2.,))
-  >>> print(out_primal)
-  0.4121185
-  >>> print(out_tangent)
-  -10.933563
-  >>> jax.defjvp(f, lambda g, ans, x: 8. * g + ans)
-  >>> out_primal, out_tangent = jax.jvp(f, (3.,), (2.,))
-  >>> print(out_primal)
-  0.4121185
-  >>> print(out_tangent)
-  16.412119
-  """
-  _check_custom_transforms_type("defjvp", fun)
-  def custom_jvp(primals, tangents):
-    ans = fun(*primals)
-    tangents_out = [rule(t, ans, *primals) for rule, t in zip(jvprules, tangents)
-                    if rule is not None and t is not ad_util.zero]
-    return ans, functools.reduce(ad.add_tangents, tangents_out, ad_util.zero)
-  defjvp_all(fun, custom_jvp)
-
-def defvjp_all(fun, custom_vjp):
-  """Define a custom VJP rule for a ``custom_transforms`` function.
-
-  If ``fun`` represents a function with signature ``a -> b``, then
-  ``custom_vjp`` represents a function with signature ``a -> (b, CT b -> CT a)``
-  where we use ``CT x`` to represent a cotangent type for the type ``x``. That
-  is, ``custom_vjp`` should take the same arguments as ``fun`` and return a pair
-  where the first element represents the primal value of ``fun`` applied to the
-  arguments, and the second element is a VJP function that maps from output
-  cotangents to input cotangents, returning a tuple with length equal to the
-  number of positional arguments supplied to ``fun``.
-
-  The VJP function returned as the second element of the output of
-  ``custom_vjp`` can close over intermediate values computed when evaluating the
-  primal value of ``fun``. That is, use lexical closure to share work between
-  the forward pass and the backward pass of reverse-mode automatic
-  differentiation.
-
-  See also ``jax.custom_gradient``.
-
-  Args:
-    fun: a custom_transforms function.
-    custom_vjp: a Python callable specifying the VJP rule, taking the same
-      arguments as ``fun`` and returning a pair where the first element is the
-      value of ``fun`` applied to the arguments and the second element is a
-      Python callable representing the VJP map from output cotangents to input
-      cotangents. The returned VJP function must accept a value with the same
-      shape as the value of ``fun`` applied to the arguments and must return a
-      tuple with length equal to the number of positional arguments to ``fun``.
-      Arguments can be arrays, scalars, or (nested) standard Python containers
-      (tuple/list/dict) thereof. Must be functionally pure.
-
-  Returns:
-    None. A side-effect is that ``fun`` is associated with the VJP rule
-    specified by ``custom_vjp``.
-
-  For example:
-
-  >>> @jax.custom_transforms
-  ... def f(x):
-  ...   return np.sin(x ** 2)
-  ...
-  >>> print(f(3.))
-  0.4121185
-  >>> print(jax.grad(f)(3.))
-  -5.4667816
-  >>> jax.defvjp_all(f, lambda x: (np.sin(x ** 2), lambda g: (g * x,)))
-  >>> print(f(3.))
-  0.4121185
-  >>> print(jax.grad(f)(3.))
-  3.0
-
-  An example with a function on two arguments, so that the VJP function must
-  return a tuple of length two:
-
-  >>> @jax.custom_transforms
-  ... def f(x, y):
-  ...   return x * y
-  ...
-  >>> jax.defvjp_all(f, lambda x, y: (x * y, lambda g: (y, x)))
-  >>> print(f(3., 4.))
-  12.0
-  >>> print(jax.grad(f, argnums=(0, 1))(3., 4.))
-  (4.0, 3.0)
-  """
-  _check_custom_transforms_type("defvjp_all", fun)
-  def custom_transforms_vjp(*consts_and_args, **params):
-    num_consts, in_tree = params['num_consts'], params['in_tree']
-    consts, args_flat = split_list(consts_and_args, [num_consts])
-    args = tree_unflatten(params['in_tree'], args_flat)
-    out, vjp = custom_vjp(*args)
-    out_flat, out_tree = tree_flatten(out)
-    if out_tree != params['out_tree']:
-      msg = (
-        "First output of `custom_vjp`: {} doesn't match the structure of "
-        "the output of `fun`: {}\n"
-        "{}\n"
-        "vs\n"
-        "{}\n".format(custom_vjp, fun, out_tree, params['out_tree'])
-      )
-      raise TypeError(msg)
-    def vjp_flat(*cts_flat):
-      cts = tree_unflatten(out_tree, cts_flat)
-      args_cts_flat, in_tree2 = tree_flatten(vjp(cts))
-      if in_tree != in_tree2:
-        msg = (
-          "Output of the `vjp`: {} doesn't match the structure of args of "
-          "`fun`: {}\n"
-          "{}\n"
-          "vs\n"
-          "{}\n".format(vjp, fun, in_tree2, in_tree)
-        )
-        raise TypeError(msg)
-      return [core.unit] * num_consts + list(args_cts_flat)
-    return out_flat, vjp_flat
-  ad.defvjp_all(fun.prim, custom_transforms_vjp)
-
-def defvjp(fun, *vjprules):
-  """Define VJP rules for each argument separately.
-
-  This function is a convenience wrapper around ``jax.defvjp_all`` for
-  separately defining VJP rules for each of the function's arguments. This
-  convenience wrapper does not provide a mechanism for depending on anything
-  other than the function arguments and its primal output value, though
-  depending on intermediate results is possible using ``jax.defvjp_all``.
-
-  The signature of each component VJP rule is ``lambda g, ans, *primals: ...``
-  where ``g`` represents the output cotangent, ``ans`` represents the output
-  primal, and ``*primals`` represents all the primal positional arguments.
-
-  Args:
-    fun: a custom_transforms function.
-    *vjprules: a sequence of functions or Nones specifying the VJP rule for each
-      corresponding positional argument. When an element is None, it indicates
-      that the Jacobian from the corresponding input to the output is zero.
-
-  Returns:
-    None. A side-effect is that ``fun`` is associated with the VJP rule
-    specified by ``*vjprules``.
-
-  For example:
-
-  >>> @jax.custom_transforms
-  ... def f(x, y):
-  ...   return np.sin(x ** 2 + y)
-  ...
-  >>> print(f(3., 4.))
-  0.42016703
-  >>> print(jax.grad(f)(3., 4.))
-  5.4446807
-  >>> print(jax.grad(f, 1)(3., 4.))
-  0.9074468
-  >>> jax.defvjp(f, None, lambda g, ans, x, y: g + x + y + ans)
-  >>> print(jax.grad(f)(3., 4.))
-  0.0
-  >>> print(jax.grad(f, 1)(3., 4.))
-  8.420167
-  """
-  _check_custom_transforms_type("defvjp", fun)
-  def custom_vjp(*primals):
-    ans = fun(*primals)
-    # TODO(mattjj): avoid instantiating zeros?
-    def vjpfun(ct):
-      return tuple(vjp(ct, ans, *primals) if vjp else ad_util.zeros_like_jaxval(x)
-                   for x, vjp in zip(primals, vjprules))
-    return ans, vjpfun
-  defvjp_all(fun, custom_vjp)
-
-def custom_gradient(fun):
-  """Convenience function for defining custom VJP rules (aka custom gradients).
-
-  While the canonical way to define custom VJP rules is via ``jax.defvjp_all``
-  and its convenience wrappers, the ``custom_gradient`` convenience wrapper
-  follows TensorFlow's ``tf.custom_gradient`` API. The difference here is that
-  ``custom_gradient`` can be used as a decorator on one function that returns
-  both the primal value (representing the output of the mathematical function to
-  be differentiated) and the VJP (gradient) function.
-
-  See https://www.tensorflow.org/api_docs/python/tf/custom_gradient.
-
-  If the mathematical function to be differentiated has type signature
-  ``a -> b``, then the Python callable ``fun`` should have signature
-  ``a -> (b, CT b -> CT a)`` where we use ``CT x`` to denote a cotangent type
-  for ``x``. See the example below. That is, ``fun`` should return a pair where
-  the first element represents the value of the mathematical function to be
-  differentiated and the second element is a function that represents the custom
-  VJP rule.
-
-  The custom VJP function returned as the second element of the output of ``fun``
-  can close over intermediate values computed when evaluating the function to be
-  differentiated. That is, use lexical closure to share work between the forward
-  pass and the backward pass of reverse-mode automatic differentiation.
-
-  Args:
-    fun: a Python callable specifying both the mathematical function to be
-      differentiated and its reverse-mode differentiation rule. It should return
-      a pair consisting of an output value and a Python callable that represents
-      the custom gradient function.
-
-  Returns:
-    A Python callable with signature ``a -> b``, i.e. that returns the output
-    value specified by the first element of ``fun``'s output pair. A side effect
-    is that under-the-hood ``jax.defvjp_all`` is called to set up the returned
-    Python callable with the custom VJP rule specified by the second element
-    of ``fun``'s output pair.
-
-  For example:
-
-  >>> @jax.custom_gradient
-  ... def f(x):
-  ...   return x ** 2, lambda g: (g * x,)
-  ...
-  >>> print(f(3.))
-  9.0
-  >>> print(jax.grad(f)(3.))
-  3.0
-
-  An example with a function on two arguments, so that the VJP function must
-  return a tuple of length two:
-
-  >>> @jax.custom_gradient
-  ... def f(x, y):
-  ...   return x * y, lambda g: (y, x)
-  ...
-  >>> print(f(3., 4.))
-  12.0
-  >>> print(jax.grad(f, argnums=(0, 1))(3., 4.))
-  (4.0, 3.0)
-  """
-  def primal_fun(*args, **kwargs):
-    ans, _ = fun(*args, **kwargs)
-    return ans
-  primal_fun = custom_transforms(primal_fun)
-  defvjp_all(primal_fun, fun)
-  return primal_fun
-
-
-def jarrett(fun):
-  new_fun = custom_transforms(fun)
-
-  def elementwise_jvp(primals, tangents):
-    pushfwd = partial(jvp, fun, primals)
-    y, jacs = vmap(pushfwd, out_axes=(None, 0))(_elementwise_std_basis(tangents))
-    flat_tangents, _ = tree_flatten(tangents)
-    out_tangent = sum([t * jac for t, jac in zip(flat_tangents, jacs)])
-    return y, out_tangent
-  defjvp_all(new_fun, elementwise_jvp)
-
-  return new_fun
-
-def _elementwise_std_basis(pytree):
-  leaves, _ = tree_flatten(pytree)
-  arity = len(leaves)
-  dims = map(onp.size, leaves)
-  # TODO(mattjj): use symbolic constants
-  dtype = dtypes.result_type(*leaves)
-  if not dtypes.issubdtype(dtype, onp.floating):
-    msg = ("Jacobian only defined for functions with floating input and output "
-           "dtypes (i.e. dtypes that model real numbers), got {}.")
-    raise TypeError(msg.format(dtype))  # TODO(mattjj, dougalm): handle complex
-  basis_array = onp.stack([onp.concatenate(
-      [onp.ones(dims[j], dtype) if i == j else onp.zeros(dims[j], dtype)
-       for j in range(arity)]) for i in range(arity)])
-  return _unravel_array_into_pytree(pytree, 1, basis_array)
-
-
-# This function mostly exists for making slides about JAX.
-def _make_graphviz(fun):
-  """Adapts `fun` to return a graphviz dot string of its program representation.
-
-  Args:
-    fun: The function whose `jaxpr` is to be rendered into graphviz dot. Its
-      positional arguments and return value should be arrays, scalars, or
-      standard Python containers (tuple/list/dict) thereof.
-
-  Returns:
-    A wrapped version of `fun`, set up to return a graphviz dot string.
-
-  See make_jaxpr for a related function.
-  """
-  # TODO(mattjj): handle eqn.restructure
-  # TODO(mattjj): handle subjaxprs
-
-  def pv_like(x):
-    aval = xla.abstractify(x)
-    return pe.PartialVal((aval, core.unit))
-
-  id_names = ("id{}".format(i) for i in it.count())
-
-  def jaxpr_to_graphviz(jaxpr, consts):
-    fragment = []
-
-    fragment.extend(map(invar_node, jaxpr.invars, jaxpr.invars))
-    fragment.extend(map(constant_node, jaxpr.constvars, consts))
-
-    for eqn in jaxpr.eqns:
-      id_name = next(id_names)
-      fragment.append(function_node(id_name, eqn.primitive.name))
-      fragment.extend(edge(invar, id_name) for invar in eqn.invars)
-      fragment.extend(edge(id_name, outvar) for outvar in eqn.outvars)
-    for ov in jaxpr.outvars:
-      fragment.append(outvar_node(ov, "out"))
-    return graph(''.join(fragment))
-
-  edge = '{} -> {} [color=gray30];\n'.format
-  function_node = '{} [label="{}", shape=box, color=lightskyblue, style=filled];\n'.format
-  invar_node = '{} [rank=2, label="{}", color=mediumspringgreen, style=filled];\n'.format
-  outvar_node = '{} [label="{}", fillcolor=indianred1, style="filled,dashed", color=black];\n'.format
-  constant_node = '{} [rank=2, label="{}", color=goldenrod1, style=filled];\n'.format
-  freevar_node = '{} [rank=2, label="{}", color=palegreen, style=filled];\n'.format
-  graph = 'digraph G {{{}}}'.format
-
-  @wraps(fun)
-  def graphviz_maker(*args, **kwargs):
-    wrapped = lu.wrap_init(fun, kwargs)
-    jax_args, in_tree = tree_flatten((args, kwargs))
-    jaxtree_fun, out_tree = flatten_fun(wrapped, in_tree)
-    pvals = map(pv_like, jax_args)
-    jaxpr, _, consts = pe.trace_to_jaxpr(jaxtree_fun, pvals)
-    return jaxpr_to_graphviz(jaxpr, consts)
-
-  graphviz_maker.__name__ = "make_graphviz({})".format(graphviz_maker.__name__)
-  return graphviz_maker
-
-
 class ShapeDtypeStruct(object):
   __slots__ = ["shape", "dtype"]
   def __init__(self, shape, dtype):
@@ -2072,3 +1545,222 @@ def checkpoint(fun, concrete=False):
     return tree_unflatten(out_tree(), out_flat)
   return fun_remat
 remat = checkpoint
+
+
+class custom_jvp:
+  __slots__ = ["fun", "nondiff_argnums", "jvp", "__weakref__"]
+
+  def __init__(self, fun, nondiff_argnums=()):
+    self.fun = fun
+    self.nondiff_argnums = nondiff_argnums
+
+  def defjvp(self, jvp):
+    self.jvp = jvp
+
+  def __call__(self, *args, **kwargs):
+    args = self._resolve_kwargs(args, kwargs)
+    if self.nondiff_argnums:
+      dyn_argnums = [i for i in range(len(args)) if i not in self.nondiff_argnums]
+      f_, dyn_args = _argnums_partial_placeholders(lu.wrap_init(self.fun), dyn_argnums, args)
+    else:
+      f_, dyn_args = lu.wrap_init(self.fun), args
+    args_flat, in_tree = tree_flatten(dyn_args)
+    flat_fun, out_tree1 = flatten_fun_nokwargs(f_, in_tree)
+    flat_jvp, out_tree2 = _flatten_jvp(lu.wrap_init(self.jvp), in_tree)
+    out_flat = custom_jvp_call(flat_fun, *args_flat, jvp=flat_jvp)
+    return tree_unflatten(_merge_thunks(out_tree1, out_tree2), out_flat)
+
+  def _resolve_kwargs(self, args, kwargs):
+    if kwargs:
+      ba = inspect.signature(self.fun).bind(*args, **kwargs)
+      ba.apply_defaults()
+      if ba.kwargs:
+        raise TypeError("keyword arguments could not be resolved to positions")
+      else:
+        return ba.args
+    else:
+      return args
+
+@lu.transformation_with_aux
+def _flatten_jvp(in_tree, *args):
+  primals_in, tangents_in = split_list(args, [len(args) // 2])
+  py_primals = tree_unflatten(in_tree, primals_in)
+  py_tangents = tree_unflatten(in_tree, tangents_in)
+  py_primals_out, py_tangents_out = yield (py_primals, py_tangents), {}
+  primals_out, out_tree = tree_flatten(py_primals_out)
+  tangents_out, out_tree2 = tree_flatten(py_tangents_out)
+  assert out_tree == out_tree2  # TODO(mattjj): better error message
+  yield primals_out + tangents_out, out_tree
+
+def _merge_thunks(f, g):
+  try: return f()
+  except lu.StoreException:
+    try: return g()
+    except lu.StoreException:
+      raise lu.StoreException("both stores empty") from None
+
+def _argnums_partial_placeholders(f, dyn_argnums, args):
+  fixed_args = tuple([core.unit if i in dyn_argnums else _wrap_hashably(arg)
+                      for i, arg in enumerate(args)])
+  dyn_args = tuple([arg if i in dyn_argnums else core.unit
+                    for i, arg in enumerate(args)])
+  return _argnums_partial_placeholders_(f, dyn_argnums, fixed_args), dyn_args
+
+@lu.transformation
+def _argnums_partial_placeholders_(dyn_argnums, fixed_args, *dyn_args, **kwargs):
+  args = [None if arg is core.unit else arg.val for arg in fixed_args]
+  for i in dyn_argnums:
+    args[i] = dyn_args[i]
+  ans = yield args, kwargs
+  yield ans
+
+def _custom_deriv_call_bind(primitive, f, *args, **params):
+  top_trace = core.find_top_trace(args)
+  level = (core.trace_state.trace_stack.next_level(True)
+           if top_trace is None else top_trace.level)
+  # f = _check_for_env_traces(f, level)  # TODO(mattjj): better error message
+  if top_trace is None:
+    with core.new_sublevel():
+      return primitive.impl(f, *args, **params)
+  else:
+    tracers = map(top_trace.full_raise, args)
+    outs = top_trace.process_custom_deriv_call(primitive, f, tracers, params)
+    outs = map(core.full_lower, outs)
+  return outs
+
+def _custom_call_impl(f, *args, **params):
+  return f.call_wrapped(*args)
+
+@lu.transformation
+def _check_for_env_traces(level, *args, **kwargs):
+  outs = yield args, kwargs
+  if any(isinstance(x, core.Tracer) and x._trace.level > level for x in outs):
+    raise Exception("closed-over traced values")
+  yield outs
+
+custom_jvp_call_p = core.Primitive('custom_jvp_call')
+custom_jvp_call = partial(_custom_deriv_call_bind, custom_jvp_call_p)
+custom_jvp_call_p.def_custom_bind(custom_jvp_call)
+custom_jvp_call_p.def_impl(_custom_call_impl)
+
+def _custom_deriv_call_jvp(trace, call_primitive, fun, tracers, params):
+  primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
+  if call_primitive is custom_jvp_call_p:
+    tangents_in = map(ad.instantiate_zeros, primals_in, tangents_in)
+    outs = params['jvp'].call_wrapped(*it.chain(primals_in, tangents_in))
+    primals_out, tangents_out = split_list(outs, [len(outs) // 2])
+    return map(partial(ad.JVPTracer, trace), primals_out, tangents_out)
+  elif call_primitive is custom_vjp_call_p:
+    assert False  # TODO
+  else:
+    raise ValueError(call_primitive)
+ad.JVPTrace.process_custom_deriv_call = _custom_deriv_call_jvp
+
+def _custom_deriv_call_vmap(trace, call_primitive, fun, tracers, params):
+  in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in tracers)
+  if call_primitive is custom_jvp_call_p:
+    jvp = params['jvp']
+    fun, out_dims = batching.batch_subtrace(fun, trace.master, in_dims)
+    jvp, out_dims2 = batching.batch_subtrace(jvp, trace.master, in_dims * 2)
+    out_vals = custom_jvp_call(fun, *in_vals, jvp=jvp)
+    out_dims = _merge_thunks(out_dims, out_dims2)[:len(out_vals)]
+    return [batching.BatchTracer(trace, v, d) for v, d in zip(out_vals, out_dims)]
+  elif call_primitive is custom_vjp_call_p:
+    assert False  # TODO
+  else:
+    raise ValueError(call_primitive)
+batching.BatchTrace.process_custom_deriv_call = _custom_deriv_call_vmap
+
+
+def _custom_deriv_call_partial_eval(trace, call_primitive, fun, tracers, params):
+  if call_primitive is custom_jvp_call_p:
+    return custom_jvp_call_jaxpr(fun, params['jvp'], *tracers)
+  elif call_primitive is custom_vjp_call_p:
+    assert False  # TODO
+  else:
+    raise ValueError(call_primitive)
+pe.JaxprTrace.process_custom_deriv_call = _custom_deriv_call_partial_eval
+
+
+def _initial_style_jaxpr(fun, in_avals):
+  in_pvals = [pe.PartialVal((aval, core.unit)) for aval in in_avals]
+  jaxpr, out_pvals, consts = pe.trace_to_jaxpr(fun, in_pvals, instantiate=True,
+                                               stage_out_calls=True)
+  out_avals = map(raise_to_shaped, unzip2(out_pvals)[0])
+  const_avals = [raise_to_shaped(core.get_aval(c)) for c in consts]
+  typed_jaxpr = core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
+                                (), const_avals + in_avals, out_avals)
+  return typed_jaxpr, consts
+
+def custom_jvp_call_jaxpr(fun, jvp, *args):
+  in_avals = [raise_to_shaped(core.get_aval(x)) for x in args]
+  jaxpr, consts = _initial_style_jaxpr(fun, in_avals)
+  return custom_jvp_call_jaxpr_p.bind(*it.chain(consts, args), jaxpr=jaxpr,
+                                      jvp=jvp, num_consts=len(consts))
+
+def _custom_jvp_call_jaxpr_impl(*args, jaxpr, jvp, num_consts):
+  del jvp, num_consts
+  return core.jaxpr_as_fun(jaxpr)(*args)
+
+def _custom_jvp_call_jaxpr_abstract_eval(*args, jaxpr, jvp, num_consts):
+  return jaxpr.out_avals
+
+def _custom_jvp_call_jaxpr_jvp(primals, tangents, jaxpr, jvp, num_consts):
+  _, primals = split_list(primals, [num_consts])
+  zero_tangents, tangents = split_list(tangents, [num_consts])
+  assert all(t is ad_util.zero for t in zero_tangents)
+  outs = jvp.call_wrapped(*(primals + tangents))
+  primals_out, tangents_out = split_list(outs, [len(outs) // 2])
+  return primals_out, tangents_out
+
+def _custom_jvp_call_jaxpr_vmap(args, in_dims, jaxpr, jvp, num_consts):
+  size, = {x.shape[d] for x, d in zip(args, in_dims)
+           if d is not batching.not_mapped}
+  args = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
+          else x for x, d in zip(args, in_dims)]
+  in_batched = [d is not batching.not_mapped for d in in_dims]
+  del in_dims
+  batched_jaxpr, out_batched = batching.batch_jaxpr(jaxpr, size, in_batched, False)
+  out_dims = [0 if b else batching.not_mapped for b in out_batched]
+
+  jvp_in_dims = [0 if b else batching.not_mapped for b in in_batched] * 2
+  batched_jvp = batching.batch_fun(jvp, jvp_in_dims, lambda: out_dims * 2)
+
+  batched_outs = custom_jvp_call_jaxpr_p.bind(
+      *args, jaxpr=batched_jaxpr, jvp=batched_jvp, num_consts=num_consts)
+  return batched_outs, out_dims
+
+_custom_jvp_call_jaxpr_translation = xla.lower_fun(
+    _custom_jvp_call_jaxpr_impl, initial_style=True)
+
+custom_jvp_call_jaxpr_p = core.Primitive('custom_jvp_call_jaxpr')
+custom_jvp_call_jaxpr_p.multiple_results = True
+custom_jvp_call_jaxpr_p.def_impl(_custom_jvp_call_jaxpr_impl)
+custom_jvp_call_jaxpr_p.def_abstract_eval(_custom_jvp_call_jaxpr_abstract_eval)
+ad.primitive_jvps[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_jvp
+xla.initial_style_translations[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_translation
+batching.primitive_batchers[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_vmap
+
+# custom_linearized_p = core.Primitive('custom_lin')
+# custom_linearized_p.def_abstract_eval(lambda *_, **params: params['avals_out'])
+# custom_linearized_p.multiple_results = True
+
+# def _custom_linearized_transpose(cts_out, *invals, num_res, bwd, avals_out,
+#                                  out_tree, res_tree, bdims):
+#   res, in_tangents = split_list(invals, [num_res])
+#   assert all(x is ad.undefined_primal for x in in_tangents)
+#   cts_out = map(ad.instantiate_zeros_aval, avals_out, cts_out)
+#   for bd_res, bd_out, bd_in in bdims:
+#     bwd = batching.batch_fun(bwd, bd_res + bd_out, lambda: bd_in)
+#   cts_in = bwd.call_wrapped(*(res + cts_out))
+#   cts_in_flat, in_tree = tree_flatten(cts_in)
+#   assert in_tree.num_leaves == len(in_tangents)
+#   return [None] * num_res + cts_in_flat
+# ad.primitive_transposes[custom_linearized_p] = _custom_linearized_transpose
+
+# def _raise_custom_vjp_error(*args, **kwargs):
+#   raise TypeError("can't apply forward-mode autodiff (jvp) to a custom_vjp "
+#                   "function.")
+# custom_linearized_p.def_impl(_raise_custom_vjp_error)
+# batching.primitive_batchers[custom_linearized_p] = _raise_custom_vjp_error
+
