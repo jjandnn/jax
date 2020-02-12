@@ -59,21 +59,23 @@ def batch_fun(fun, in_dims, out_dim_dests):
 
 @lu.transformation
 def _batch_fun(in_dims, out_dims, out_dim_dests, *in_vals, **params):
+  in_dims = in_dims() if callable(in_dims) else in_dims
   size, = {x.shape[d] for x, d in zip(in_vals, in_dims) if d is not not_mapped}
   with new_master(BatchTrace) as master:
     out_vals = yield (master, in_dims,) + in_vals, params
     del master
-  out_vals = map(partial(matchaxis, size), out_dims(), out_dim_dests(), out_vals)
+  out_dim_dests = out_dim_dests() if callable(out_dim_dests) else out_dim_dests
+  out_vals = map(partial(matchaxis, size), out_dims(), out_dim_dests, out_vals)
   yield out_vals
 
-def batch_fun2(fun, bottom, in_dims):
+def batch_fun2(fun, in_dims):
   # transformation version of batch2, which doesn't call the function
   fun, out_dims = batch_subtrace(fun)
-  return _batch_fun2(fun, bottom, in_dims), out_dims
+  return _batch_fun2(fun, in_dims), out_dims
 
 @lu.transformation
-def _batch_fun2(bottom, in_dims, *in_vals, **params):
-  with new_master(BatchTrace, bottom) as master:
+def _batch_fun2(in_dims, *in_vals, **params):
+  with new_master(BatchTrace) as master:
     out_vals = yield (master, in_dims,) + in_vals, params
     del master
   yield out_vals

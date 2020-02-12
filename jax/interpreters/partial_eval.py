@@ -284,7 +284,7 @@ class JaxprTracer(Tracer):
     assert isinstance(pval, PartialVal)
     pv, const = pval
     if isinstance(const, Tracer) and const._trace.level >= trace.level:
-      trace.escaped_tracer_error(
+      core.escaped_tracer_error(
         "Tracer from a higher level: {} in trace {}".format(const, trace))
     self._trace = trace
     self.pval = pval
@@ -347,10 +347,11 @@ def partial_val_aval(pv, const):
   else:
     raise TypeError(pv)
 
-def trace_to_jaxpr(fun, pvals, instantiate=False, stage_out_calls=False):
+def trace_to_jaxpr(fun, pvals, instantiate=False, stage_out_calls=False,
+                   bottom=False):
   """Traces a function, given abstract inputs, to a jaxpr."""
   trace_type = StagingJaxprTrace if stage_out_calls else JaxprTrace
-  with new_master(trace_type) as master:
+  with new_master(trace_type, bottom) as master:
     fun = trace_to_subjaxpr(fun, master, instantiate)
     jaxpr, (out_pvals, consts, env) = fun.call_wrapped(pvals)
     assert not env
@@ -440,7 +441,7 @@ def tracers_to_jaxpr(in_tracers, out_tracers):
         processed_eqn_ids.add(recipe.eqn_id)
     elif isinstance(recipe, LambdaBinding):
       if not any(t is in_tracer for in_tracer in in_tracers):
-        t._trace.escaped_tracer_error("Tracer not among input tracers {}".format(t))
+        core.escaped_tracer_error("Tracer not among input tracers {}".format(t))
       assert in_tracers, "Lambda binding with no args"
     elif isinstance(recipe, FreeVar):
       env[getvar(t)] = recipe.val

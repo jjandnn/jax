@@ -27,7 +27,6 @@ arrays.
 import collections
 import functools
 import itertools as it
-import inspect
 import operator as op
 import os
 import threading
@@ -42,12 +41,12 @@ from . import ad_util
 from . import dtypes
 from .core import eval_jaxpr
 from .api_util import (wraps, flatten_fun, apply_flat_fun, flatten_fun_nokwargs,
-                       flatten_fun_nokwargs2)
+                       flatten_fun_nokwargs2, argnums_partial)
 from .tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure,
                         tree_transpose, tree_leaves, tree_multimap,
                         _replace_nones)
-from .util import (unzip2, unzip3, curry, partial, safe_map, safe_zip,
-                   WrapHashably, Hashable, prod, split_list, extend_name_stack, wrap_name)
+from .util import (unzip2, unzip3, curry, partial, safe_map, safe_zip, prod,
+                   split_list, extend_name_stack, wrap_name)
 from .lib import xla_bridge as xb
 from .lib.xla_bridge import (device_count, local_device_count, devices, local_devices,
                              host_id, host_ids, host_count)
@@ -60,6 +59,7 @@ from .interpreters import batching
 from .interpreters import parallel
 from .interpreters import masking
 from .interpreters.masking import shapecheck, ensure_poly
+from .custom_derivatives import custom_jvp, custom_vjp
 from .config import flags, config, bool_env
 
 map = safe_map
@@ -128,7 +128,7 @@ def jit(fun, static_argnums=(), device=None, backend=None):
 
   @wraps(fun)
   def f_jitted(*args, **kwargs):
-    if _thread_local_state.jit_is_disabled or config.read('jax_disable_jit'):
+    if _jit_is_disabled():
       return fun(*args, **kwargs)
     if static_argnums and max(static_argnums) >= len(args):
       msg = ("Jitted function has static_argnums={} but was called with only {}"
@@ -137,7 +137,7 @@ def jit(fun, static_argnums=(), device=None, backend=None):
     f = lu.wrap_init(fun)
     if static_argnums:
       dyn_argnums = [i for i in range(len(args)) if i not in static_argnums]
-      f, dyn_args = _argnums_partial(f, dyn_argnums, args)
+      f, dyn_args = argnums_partial(f, dyn_argnums, args)
     else:
       dyn_args = args
     args_flat, in_tree = tree_flatten((dyn_args, kwargs))
@@ -192,6 +192,9 @@ def disable_jit():
     yield
   finally:
     _thread_local_state.jit_is_disabled = prev_val
+
+def _jit_is_disabled():
+  return _thread_local_state.jit_is_disabled or config.read('jax_disable_jit')
 
 
 def xla_computation(fun, static_argnums=(), axis_env=None, backend=None,
@@ -403,7 +406,7 @@ def value_and_grad(fun, argnums=0, has_aux=False, holomorphic=False):
       raise TypeError(msg.format(argnums, max_argnum + 1, len(args)))
 
     f = lu.wrap_init(fun, kwargs)
-    f_partial, dyn_args = _argnums_partial(f, argnums, args)
+    f_partial, dyn_args = argnums_partial(f, argnums, args)
     if not has_aux:
       ans, vjp_py = vjp(f_partial, *dyn_args)
     else:
@@ -465,7 +468,7 @@ def jacfwd(fun, argnums=0, holomorphic=False):
 
   def jacfun(*args, **kwargs):
     f = lu.wrap_init(fun, kwargs)
-    f_partial, dyn_args = _argnums_partial(f, argnums, args)
+    f_partial, dyn_args = argnums_partial(f, argnums, args)
     holomorphic or tree_map(_check_real_input_jacfwd, dyn_args)
     pushfwd = partial(jvp, f_partial, dyn_args)
     y, jac = vmap(pushfwd, out_axes=(None, batching.last))(_std_basis(dyn_args))
@@ -509,7 +512,7 @@ def jacrev(fun, argnums=0, holomorphic=False):
   """
   def jacfun(*args, **kwargs):
     f = lu.wrap_init(fun, kwargs)
-    f_partial, dyn_args = _argnums_partial(f, argnums, args)
+    f_partial, dyn_args = argnums_partial(f, argnums, args)
     y, pullback = vjp(f_partial, *dyn_args)
     holomorphic or tree_map(_check_real_output_jacrev, y)
     jac = vmap(pullback)(_std_basis(y))
@@ -890,7 +893,7 @@ def pmap(fun, axis_name=None, static_broadcasted_argnums=(), devices=None, backe
     f = lu.wrap_init(fun)
     if static_broadcasted_argnums:
       dyn_argnums = [i for i in range(len(args)) if i not in static_broadcasted_argnums]
-      f, dyn_args = _argnums_partial(f, dyn_argnums, args)
+      f, dyn_args = argnums_partial(f, dyn_argnums, args)
     else:
       dyn_args = args
     args, in_tree = tree_flatten((dyn_args, kwargs))
@@ -1399,32 +1402,6 @@ def device_get(x):
   return tree_map(_device_get, x)
 
 
-def _argnums_partial(f, dyn_argnums, args):
-  if isinstance(dyn_argnums, int):
-    dyn_argnums = (dyn_argnums,)
-  else:
-    dyn_argnums = tuple(dyn_argnums)
-  fixed_args = tuple([core.unit if i in dyn_argnums else _wrap_hashably(arg)
-                      for i, arg in enumerate(args)])
-  dyn_args = tuple(args[i] for i in dyn_argnums)
-  return _argnums_partial_(f, dyn_argnums, fixed_args), dyn_args
-
-def _wrap_hashably(arg):
-  try:
-    hash(arg)
-  except TypeError:
-    return WrapHashably(arg)  # e.g. ndarrays, DeviceArrays
-  else:
-    return Hashable(arg)
-
-@lu.transformation
-def _argnums_partial_(dyn_argnums, fixed_args, *dyn_args, **kwargs):
-  args = [None if arg is core.unit else arg.val for arg in fixed_args]
-  for i, arg in zip(dyn_argnums, dyn_args):
-    args[i] = arg
-  ans = yield args, kwargs
-  yield ans
-
 def _check_args(args):
   for arg in args:
     if not (isinstance(arg, core.Tracer) or _valid_jaxtype(arg)):
@@ -1545,222 +1522,3 @@ def checkpoint(fun, concrete=False):
     return tree_unflatten(out_tree(), out_flat)
   return fun_remat
 remat = checkpoint
-
-
-class custom_jvp:
-  __slots__ = ["fun", "nondiff_argnums", "jvp", "__weakref__"]
-
-  def __init__(self, fun, nondiff_argnums=()):
-    self.fun = fun
-    self.nondiff_argnums = nondiff_argnums
-
-  def defjvp(self, jvp):
-    self.jvp = jvp
-
-  def __call__(self, *args, **kwargs):
-    args = self._resolve_kwargs(args, kwargs)
-    if self.nondiff_argnums:
-      dyn_argnums = [i for i in range(len(args)) if i not in self.nondiff_argnums]
-      f_, dyn_args = _argnums_partial_placeholders(lu.wrap_init(self.fun), dyn_argnums, args)
-    else:
-      f_, dyn_args = lu.wrap_init(self.fun), args
-    args_flat, in_tree = tree_flatten(dyn_args)
-    flat_fun, out_tree1 = flatten_fun_nokwargs(f_, in_tree)
-    flat_jvp, out_tree2 = _flatten_jvp(lu.wrap_init(self.jvp), in_tree)
-    out_flat = custom_jvp_call(flat_fun, *args_flat, jvp=flat_jvp)
-    return tree_unflatten(_merge_thunks(out_tree1, out_tree2), out_flat)
-
-  def _resolve_kwargs(self, args, kwargs):
-    if kwargs:
-      ba = inspect.signature(self.fun).bind(*args, **kwargs)
-      ba.apply_defaults()
-      if ba.kwargs:
-        raise TypeError("keyword arguments could not be resolved to positions")
-      else:
-        return ba.args
-    else:
-      return args
-
-@lu.transformation_with_aux
-def _flatten_jvp(in_tree, *args):
-  primals_in, tangents_in = split_list(args, [len(args) // 2])
-  py_primals = tree_unflatten(in_tree, primals_in)
-  py_tangents = tree_unflatten(in_tree, tangents_in)
-  py_primals_out, py_tangents_out = yield (py_primals, py_tangents), {}
-  primals_out, out_tree = tree_flatten(py_primals_out)
-  tangents_out, out_tree2 = tree_flatten(py_tangents_out)
-  assert out_tree == out_tree2  # TODO(mattjj): better error message
-  yield primals_out + tangents_out, out_tree
-
-def _merge_thunks(f, g):
-  try: return f()
-  except lu.StoreException:
-    try: return g()
-    except lu.StoreException:
-      raise lu.StoreException("both stores empty") from None
-
-def _argnums_partial_placeholders(f, dyn_argnums, args):
-  fixed_args = tuple([core.unit if i in dyn_argnums else _wrap_hashably(arg)
-                      for i, arg in enumerate(args)])
-  dyn_args = tuple([arg if i in dyn_argnums else core.unit
-                    for i, arg in enumerate(args)])
-  return _argnums_partial_placeholders_(f, dyn_argnums, fixed_args), dyn_args
-
-@lu.transformation
-def _argnums_partial_placeholders_(dyn_argnums, fixed_args, *dyn_args, **kwargs):
-  args = [None if arg is core.unit else arg.val for arg in fixed_args]
-  for i in dyn_argnums:
-    args[i] = dyn_args[i]
-  ans = yield args, kwargs
-  yield ans
-
-def _custom_deriv_call_bind(primitive, f, *args, **params):
-  top_trace = core.find_top_trace(args)
-  level = (core.trace_state.trace_stack.next_level(True)
-           if top_trace is None else top_trace.level)
-  # f = _check_for_env_traces(f, level)  # TODO(mattjj): better error message
-  if top_trace is None:
-    with core.new_sublevel():
-      return primitive.impl(f, *args, **params)
-  else:
-    tracers = map(top_trace.full_raise, args)
-    outs = top_trace.process_custom_deriv_call(primitive, f, tracers, params)
-    outs = map(core.full_lower, outs)
-  return outs
-
-def _custom_call_impl(f, *args, **params):
-  return f.call_wrapped(*args)
-
-@lu.transformation
-def _check_for_env_traces(level, *args, **kwargs):
-  outs = yield args, kwargs
-  if any(isinstance(x, core.Tracer) and x._trace.level > level for x in outs):
-    raise Exception("closed-over traced values")
-  yield outs
-
-custom_jvp_call_p = core.Primitive('custom_jvp_call')
-custom_jvp_call = partial(_custom_deriv_call_bind, custom_jvp_call_p)
-custom_jvp_call_p.def_custom_bind(custom_jvp_call)
-custom_jvp_call_p.def_impl(_custom_call_impl)
-
-def _custom_deriv_call_jvp(trace, call_primitive, fun, tracers, params):
-  primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
-  if call_primitive is custom_jvp_call_p:
-    tangents_in = map(ad.instantiate_zeros, primals_in, tangents_in)
-    outs = params['jvp'].call_wrapped(*it.chain(primals_in, tangents_in))
-    primals_out, tangents_out = split_list(outs, [len(outs) // 2])
-    return map(partial(ad.JVPTracer, trace), primals_out, tangents_out)
-  elif call_primitive is custom_vjp_call_p:
-    assert False  # TODO
-  else:
-    raise ValueError(call_primitive)
-ad.JVPTrace.process_custom_deriv_call = _custom_deriv_call_jvp
-
-def _custom_deriv_call_vmap(trace, call_primitive, fun, tracers, params):
-  in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in tracers)
-  if call_primitive is custom_jvp_call_p:
-    jvp = params['jvp']
-    fun, out_dims = batching.batch_subtrace(fun, trace.master, in_dims)
-    jvp, out_dims2 = batching.batch_subtrace(jvp, trace.master, in_dims * 2)
-    out_vals = custom_jvp_call(fun, *in_vals, jvp=jvp)
-    out_dims = _merge_thunks(out_dims, out_dims2)[:len(out_vals)]
-    return [batching.BatchTracer(trace, v, d) for v, d in zip(out_vals, out_dims)]
-  elif call_primitive is custom_vjp_call_p:
-    assert False  # TODO
-  else:
-    raise ValueError(call_primitive)
-batching.BatchTrace.process_custom_deriv_call = _custom_deriv_call_vmap
-
-
-def _custom_deriv_call_partial_eval(trace, call_primitive, fun, tracers, params):
-  if call_primitive is custom_jvp_call_p:
-    return custom_jvp_call_jaxpr(fun, params['jvp'], *tracers)
-  elif call_primitive is custom_vjp_call_p:
-    assert False  # TODO
-  else:
-    raise ValueError(call_primitive)
-pe.JaxprTrace.process_custom_deriv_call = _custom_deriv_call_partial_eval
-
-
-def _initial_style_jaxpr(fun, in_avals):
-  in_pvals = [pe.PartialVal((aval, core.unit)) for aval in in_avals]
-  jaxpr, out_pvals, consts = pe.trace_to_jaxpr(fun, in_pvals, instantiate=True,
-                                               stage_out_calls=True)
-  out_avals = map(raise_to_shaped, unzip2(out_pvals)[0])
-  const_avals = [raise_to_shaped(core.get_aval(c)) for c in consts]
-  typed_jaxpr = core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
-                                (), const_avals + in_avals, out_avals)
-  return typed_jaxpr, consts
-
-def custom_jvp_call_jaxpr(fun, jvp, *args):
-  in_avals = [raise_to_shaped(core.get_aval(x)) for x in args]
-  jaxpr, consts = _initial_style_jaxpr(fun, in_avals)
-  return custom_jvp_call_jaxpr_p.bind(*it.chain(consts, args), jaxpr=jaxpr,
-                                      jvp=jvp, num_consts=len(consts))
-
-def _custom_jvp_call_jaxpr_impl(*args, jaxpr, jvp, num_consts):
-  del jvp, num_consts
-  return core.jaxpr_as_fun(jaxpr)(*args)
-
-def _custom_jvp_call_jaxpr_abstract_eval(*args, jaxpr, jvp, num_consts):
-  return jaxpr.out_avals
-
-def _custom_jvp_call_jaxpr_jvp(primals, tangents, jaxpr, jvp, num_consts):
-  _, primals = split_list(primals, [num_consts])
-  zero_tangents, tangents = split_list(tangents, [num_consts])
-  assert all(t is ad_util.zero for t in zero_tangents)
-  outs = jvp.call_wrapped(*(primals + tangents))
-  primals_out, tangents_out = split_list(outs, [len(outs) // 2])
-  return primals_out, tangents_out
-
-def _custom_jvp_call_jaxpr_vmap(args, in_dims, jaxpr, jvp, num_consts):
-  size, = {x.shape[d] for x, d in zip(args, in_dims)
-           if d is not batching.not_mapped}
-  args = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
-          else x for x, d in zip(args, in_dims)]
-  in_batched = [d is not batching.not_mapped for d in in_dims]
-  del in_dims
-  batched_jaxpr, out_batched = batching.batch_jaxpr(jaxpr, size, in_batched, False)
-  out_dims = [0 if b else batching.not_mapped for b in out_batched]
-
-  jvp_in_dims = [0 if b else batching.not_mapped for b in in_batched] * 2
-  batched_jvp = batching.batch_fun(jvp, jvp_in_dims, lambda: out_dims * 2)
-
-  batched_outs = custom_jvp_call_jaxpr_p.bind(
-      *args, jaxpr=batched_jaxpr, jvp=batched_jvp, num_consts=num_consts)
-  return batched_outs, out_dims
-
-_custom_jvp_call_jaxpr_translation = xla.lower_fun(
-    _custom_jvp_call_jaxpr_impl, initial_style=True)
-
-custom_jvp_call_jaxpr_p = core.Primitive('custom_jvp_call_jaxpr')
-custom_jvp_call_jaxpr_p.multiple_results = True
-custom_jvp_call_jaxpr_p.def_impl(_custom_jvp_call_jaxpr_impl)
-custom_jvp_call_jaxpr_p.def_abstract_eval(_custom_jvp_call_jaxpr_abstract_eval)
-ad.primitive_jvps[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_jvp
-xla.initial_style_translations[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_translation
-batching.primitive_batchers[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_vmap
-
-# custom_linearized_p = core.Primitive('custom_lin')
-# custom_linearized_p.def_abstract_eval(lambda *_, **params: params['avals_out'])
-# custom_linearized_p.multiple_results = True
-
-# def _custom_linearized_transpose(cts_out, *invals, num_res, bwd, avals_out,
-#                                  out_tree, res_tree, bdims):
-#   res, in_tangents = split_list(invals, [num_res])
-#   assert all(x is ad.undefined_primal for x in in_tangents)
-#   cts_out = map(ad.instantiate_zeros_aval, avals_out, cts_out)
-#   for bd_res, bd_out, bd_in in bdims:
-#     bwd = batching.batch_fun(bwd, bd_res + bd_out, lambda: bd_in)
-#   cts_in = bwd.call_wrapped(*(res + cts_out))
-#   cts_in_flat, in_tree = tree_flatten(cts_in)
-#   assert in_tree.num_leaves == len(in_tangents)
-#   return [None] * num_res + cts_in_flat
-# ad.primitive_transposes[custom_linearized_p] = _custom_linearized_transpose
-
-# def _raise_custom_vjp_error(*args, **kwargs):
-#   raise TypeError("can't apply forward-mode autodiff (jvp) to a custom_vjp "
-#                   "function.")
-# custom_linearized_p.def_impl(_raise_custom_vjp_error)
-# batching.primitive_batchers[custom_linearized_p] = _raise_custom_vjp_error
-
